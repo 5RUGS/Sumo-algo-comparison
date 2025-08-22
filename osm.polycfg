@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 
-<!-- generated on 2025-08-18 13:42:03 by Eclipse SUMO polyconvert Version 1.24.0
+<!-- generated on 2025-08-18 13:54:37 by Eclipse SUMO polyconvert Version 1.23.1
 -->
 
 <polyconvertConfiguration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/polyconvertConfiguration.xsd">
@@ -10,7 +10,7 @@
         <osm-files value="osm_bbox.osm.xml.gz"/>
         <osm.keep-full-type value="true"/>
         <osm.merge-relations value="1"/>
-        <type-file value="${SUMO_HOME}/data/typemap/osmPolyconvert.typ.xml"/>
+        <type-file value="${SUMO_HOME}\data\typemap\osmPolyconvert.typ.xml"/>
     </input>
 
     <output>
