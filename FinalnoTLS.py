@@ -1,8 +1,8 @@
-# show_route_all_debug.py
+# FinalnoTLS.py
 # -*- coding: utf-8 -*-
 
 import os, sys, glob, csv, time, xml.etree.ElementTree as ET
-from collections import defaultdict, deque  # <-- เพิ่ม deque แค่นี้
+from collections import defaultdict, deque
 import warnings
 warnings.filterwarnings("ignore", message=".*deprecated function getAllProgramLogics.*")
 
@@ -35,28 +35,59 @@ PROGRESS_EVERY_SIMSEC = 30
 NO_OPT = False
 TAG = ""
 
-# ---- NEW: บัฟเฟอร์เก็บ N ค่า/edge ----
+# Rolling buffers per-edge
 WINDOW_N = 10
 EDGE_BUF = {}  # edge_id -> {"speed": deque(maxlen=WINDOW_N), "occ": deque(maxlen=WINDOW_N)}
 
 # =========================
-# Config / file helpers
+# Config helpers
 # =========================
-def find_cfg():
-    for f in glob.glob("*.sumocfg"):
-        return f
-    raise FileNotFoundError("No .sumocfg found in current folder")
+def resolve_cfg_path() -> str:
+    """
+    Order:
+      1) argv[1] if provided and exists
+      2) env SUMO_CFG if exists
+      3) ./osm.sumocfg if exists
+      4) first *.sumocfg in CWD
+    """
+    # 1) CLI arg
+    if len(sys.argv) > 1:
+        arg = sys.argv[1]
+        if os.path.isabs(arg) and os.path.exists(arg):
+            return arg
+        # allow relative path based on CWD
+        cand = os.path.abspath(arg)
+        if os.path.exists(cand):
+            return cand
+
+    # 2) env
+    env_cfg = os.environ.get("SUMO_CFG")
+    if env_cfg:
+        cand = os.path.abspath(env_cfg)
+        if os.path.exists(cand):
+            return cand
+
+    # 3) preferred default
+    if os.path.exists("osm.sumocfg"):
+        return os.path.abspath("osm.sumocfg")
+
+    # 4) any *.sumocfg
+    all_cfgs = sorted(glob.glob("*.sumocfg"))
+    if all_cfgs:
+        return os.path.abspath(all_cfgs[0])
+
+    raise FileNotFoundError("No .sumocfg found. Pass it as argv[1] or set SUMO_CFG or place osm.sumocfg in CWD.")
 
 def read_net_from_cfg(cfg_path):
     try:
         root = ET.parse(cfg_path).getroot()
         tag = root.find(".//input/net-file")
         if tag is not None and "value" in tag.attrib:
-            return os.path.join(os.path.dirname(cfg_path), tag.attrib["value"])
+            return os.path.abspath(os.path.join(os.path.dirname(cfg_path), tag.attrib["value"]))
     except ET.ParseError:
         pass
-    nets = glob.glob("*.net.xml")
-    return nets[0] if nets else None
+    nets = glob.glob("*.net.xml*")  # allow .gz too if present
+    return os.path.abspath(nets[0]) if nets else None
 
 def read_route_files_from_cfg(cfg_path):
     try:
@@ -65,10 +96,12 @@ def read_route_files_from_cfg(cfg_path):
         if tag is None or "value" not in tag.attrib:
             return []
         base = os.path.dirname(cfg_path)
-        return [os.path.join(base, v) for v in tag.attrib["value"].split()]
+        out = []
+        for v in tag.attrib["value"].split():
+            out.append(os.path.abspath(os.path.join(base, v)))
+        return out
     except ET.ParseError:
         return []
-
 
 # =========================
 # Lane/edge utils
@@ -134,7 +167,6 @@ def has_edge_connection_any_lane(a, b):
         pass
     return False
 
-
 # =========================
 # Build EDGE graph
 # =========================
@@ -167,13 +199,10 @@ def build_edge_graph_from_traci(vehicle_class=None):
             G.add_edge(base_edge, to_edge)
     return G
 
-
 # =========================
 # Cost model (no TLS)
 # =========================
 def expected_speed(out_edge, speed_limit):
-    """เก็บค่า N ค่าล่าสุด (speed/occupancy) ต่อ edge แล้ว 'เฉลี่ย' ใช้ต่อ"""
-    # อ่านล่าสุด
     try:
         occ = traci.edge.getLastStepOccupancy(out_edge)
     except Exception:
@@ -183,15 +212,13 @@ def expected_speed(out_edge, speed_limit):
     except Exception:
         mean_speed = None
 
-    # ปรับค่า fallback ให้ปลอดภัย
-    if not isinstance(occ, (int, float)) or occ != occ:  # NaN check
+    if not isinstance(occ, (int, float)) or occ != occ:
         occ = 0.0
     occ = max(0.0, min(1.0, float(occ)))
 
     if not isinstance(mean_speed, (int, float)) or mean_speed <= 0:
         mean_speed = speed_limit * MIN_SPEED_FRACTION
 
-    # บัฟเฟอร์ per-edge
     buf = EDGE_BUF.setdefault(out_edge, {
         "speed": deque(maxlen=WINDOW_N),
         "occ":   deque(maxlen=WINDOW_N),
@@ -199,11 +226,9 @@ def expected_speed(out_edge, speed_limit):
     buf["speed"].append(float(mean_speed))
     buf["occ"].append(float(occ))
 
-    # เฉลี่ยธรรมดา (mean) N ค่าล่าสุด
     sm_speed = sum(buf["speed"]) / len(buf["speed"])
     sm_occ   = sum(buf["occ"]) / len(buf["occ"])
 
-    # ใช้เงื่อนไขเดิม แต่ใช้ค่าที่เฉลี่ยแล้ว
     if sm_occ < OCCUPANCY_FREE_THRESH:
         use_speed = max(speed_limit, 0.1)
     elif sm_speed > SMOOTHING_MIN_SPEED:
@@ -213,25 +238,30 @@ def expected_speed(out_edge, speed_limit):
 
     return use_speed, sm_occ
 
-
-
 # =========================
 # Main
 # =========================
 def main():
-    wall_start = time.perf_counter()  # measure processing time (wall-clock)
+    wall_start = time.perf_counter()
 
-    cfg = find_cfg()
+    cfg = resolve_cfg_path()
     net_path = read_net_from_cfg(cfg)
     if not net_path or not os.path.exists(net_path):
-        raise FileNotFoundError("Cannot locate .net.xml")
-    for rf in read_route_files_from_cfg(cfg):
+        raise FileNotFoundError(f"Cannot locate .net.xml referenced by cfg: {cfg}")
+
+    route_files = read_route_files_from_cfg(cfg)
+    for rf in route_files:
         if not os.path.exists(rf):
             raise FileNotFoundError(f"route-file not found: {rf}")
 
+    print(f"[CFG] Using cfg: {cfg}")
+    print(f"[NET] Using net: {net_path}")
+    if route_files:
+        print("[ROUTES] " + ", ".join(route_files))
+
     agg_csv = f"aggregates{TAG}.csv"
-    sumo = sumolib.checkBinary("sumo-gui")
-    cmd = [sumo, "-c", cfg, "--quit-on-end"]
+    sumo_bin = sumolib.checkBinary("sumo")  # can change to "sumo-gui" if you want GUI
+    cmd = [sumo_bin, "-c", cfg, "--quit-on-end"]
     print("[INFO] Launching:", " ".join(cmd))
     traci.start(cmd)
 
@@ -252,12 +282,11 @@ def main():
         edge_graph_cache = {}
         last_progress_bucket = -1
 
-        # simulate
         while traci.simulation.getMinExpectedNumber() > 0:
             traci.simulationStep()
             sim_time = traci.simulation.getTime()
 
-            # step size in seconds (Δt)
+            # step size (s)
             try:
                 step_sec = traci.simulation.getDeltaT() / 1000.0
             except Exception:
@@ -300,9 +329,7 @@ def main():
 
             # 3) reroute
             if not NO_OPT:
-                # ====== [B] PRECOMPUTE EDGE WEIGHTS PER STEP / PER VEHICLE CLASS ======
                 def compute_edge_weights_for_class(veh_class_key, G):
-                    # เตรียม cost ต่อ out_edge (node v) ครั้งเดียว
                     per_out_edge_cost = {}
                     for v in G.nodes:
                         nd = G.nodes[v]
@@ -311,32 +338,25 @@ def main():
                         base_tt = nd.get("length", 1.0) / max(use_speed, 0.1)
                         cost = base_tt * (1.0 + DENSITY_ALPHA * float(occ))
                         per_out_edge_cost[v] = cost
-                    # กำหนด weight ให้ทุกขอบ (u, v)
                     for u, v in G.edges:
                         G.edges[u, v]["w"] = per_out_edge_cost[v]
 
-                # รวบรวมคลาสของรถที่ active ในสเต็ปนี้
                 step_classes = set()
                 for vid in active_ids:
                     step_classes.add(get_vehicle_class(vid) or "_ANY_")
 
-                # ให้แน่ใจว่ามีกราฟของแต่ละคลาส และคำนวณ weight ล่วงหน้า
                 for cls in step_classes:
                     if cls not in edge_graph_cache:
-                        # สร้างกราฟตามคลาส (เหมือนเดิม)
                         real_cls = None if cls == "_ANY_" else cls
                         edge_graph_cache[cls] = build_edge_graph_from_traci(real_cls)
                     compute_edge_weights_for_class(cls, edge_graph_cache[cls])
-                # ====== [B] END ======
 
                 for vid in active_ids:
-                    # เดิม: if sim_time < cooldown_until[vid] or (sim_time - last_reroute[vid] < REROUTE_PERIOD): continue
                     try:
                         lane_id = traci.vehicle.getLaneID(vid)
                         lane_pos = traci.vehicle.getLanePosition(vid)
                         lane_len = traci.lane.getLength(lane_id)
                         if (lane_len - lane_pos) < NEAR_JUNCTION_SKIP_DIST:
-                            print("near")
                             continue
                     except traci.TraCIException:
                         pass
@@ -366,11 +386,9 @@ def main():
                         try:
                             traci.vehicle.rerouteTraveltime(vid)
                         except traci.TraCIException:
-                            print("inv")
                             pass
                         continue
 
-                    # === ใช้ weight='w' ที่คำนวณล่วงหน้าแล้ว ===
                     try:
                         edge_path_new = nx.shortest_path(G, cur_edge, dest_edge, weight="w")
                     except Exception:
@@ -380,13 +398,11 @@ def main():
                         try:
                             traci.vehicle.rerouteTraveltime(vid)
                         except traci.TraCIException:
-                            print("fail reroute")
                             pass
                         continue
 
                     new_route = list(edge_path_new)
 
-                    # minimal validations
                     allowed_from_lane = next_edges_allowed_from_current_lane(vid)
                     if len(new_route) >= 2 and allowed_from_lane and (new_route[1] not in allowed_from_lane):
                         continue
@@ -455,7 +471,6 @@ def main():
             traci.close(False)
         except Exception:
             pass
-
 
 if __name__ == "__main__":
     main()
