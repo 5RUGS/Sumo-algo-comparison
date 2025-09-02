@@ -55,7 +55,6 @@ def resolve_cfg_path() -> str:
         arg = sys.argv[1]
         if os.path.isabs(arg) and os.path.exists(arg):
             return arg
-        # allow relative path based on CWD
         cand = os.path.abspath(arg)
         if os.path.exists(cand):
             return cand
@@ -86,7 +85,7 @@ def read_net_from_cfg(cfg_path):
             return os.path.abspath(os.path.join(os.path.dirname(cfg_path), tag.attrib["value"]))
     except ET.ParseError:
         pass
-    nets = glob.glob("*.net.xml*")  # allow .gz too if present
+    nets = glob.glob("*.net.xml*")
     return os.path.abspath(nets[0]) if nets else None
 
 def read_route_files_from_cfg(cfg_path):
@@ -96,10 +95,7 @@ def read_route_files_from_cfg(cfg_path):
         if tag is None or "value" not in tag.attrib:
             return []
         base = os.path.dirname(cfg_path)
-        out = []
-        for v in tag.attrib["value"].split():
-            out.append(os.path.abspath(os.path.join(base, v)))
-        return out
+        return [os.path.abspath(os.path.join(base, v)) for v in tag.attrib["value"].split()]
     except ET.ParseError:
         return []
 
@@ -184,6 +180,7 @@ def build_edge_graph_from_traci(vehicle_class=None):
         except Exception:
             speed_limit = 13.9
         G.add_node(eid, length=length, speed_limit=speed_limit)
+
     for lane_id in traci.lane.getIDList():
         base_edge = lane_id.split("_")[0] if "_" in lane_id else lane_id
         if (not base_edge) or base_edge.startswith(":") or (base_edge not in G):
@@ -219,15 +216,12 @@ def expected_speed(out_edge, speed_limit):
     if not isinstance(mean_speed, (int, float)) or mean_speed <= 0:
         mean_speed = speed_limit * MIN_SPEED_FRACTION
 
-    buf = EDGE_BUF.setdefault(out_edge, {
-        "speed": deque(maxlen=WINDOW_N),
-        "occ":   deque(maxlen=WINDOW_N),
-    })
+    buf = EDGE_BUF.setdefault(out_edge, {"speed": deque(maxlen=WINDOW_N), "occ": deque(maxlen=WINDOW_N)})
     buf["speed"].append(float(mean_speed))
     buf["occ"].append(float(occ))
 
     sm_speed = sum(buf["speed"]) / len(buf["speed"])
-    sm_occ   = sum(buf["occ"]) / len(buf["occ"]])
+    sm_occ   = sum(buf["occ"]) / len(buf["occ"])
 
     if sm_occ < OCCUPANCY_FREE_THRESH:
         use_speed = max(speed_limit, 0.1)
@@ -239,14 +233,13 @@ def expected_speed(out_edge, speed_limit):
     return use_speed, sm_occ
 
 # =========================
-# Prediction helper (for MAE/RMAE)
+# Prediction helpers (Approach 2: per decision window)
 # =========================
 def predict_remaining_time_for_route(G, current_edge, lane_id, lane_pos, route_edges):
     """
     คาดเวลาเดินทางที่เหลือจาก 'จุดปัจจุบัน' บน lane_id/lane_pos
-    route_edges ควรเป็น route เช่น [cur, next, ... , dest]
-    - เศษระยะบนเลนปัจจุบัน
-    - บวก weight ของขอบถัดๆ ไป (G.edges[u,v]["w"]) ถ้าไม่มี weight ใช้ length/speed_limit
+    - คิดเศษระยะบนเลนปัจจุบัน
+    - บวกน้ำหนักของขอบถัด ๆ ไป (G.edges[u,v]["w"]) ถ้าไม่มี weight ใช้ length/speed_limit ของ node ปลายทาง v
     """
     try:
         lane_len = traci.lane.getLength(lane_id)
@@ -262,7 +255,7 @@ def predict_remaining_time_for_route(G, current_edge, lane_id, lane_pos, route_e
         use_speed, _ = expected_speed(current_edge, speed_limit)
         rem_time_cur = rem_len / max(use_speed, 0.1)
 
-    # 2) เวลาตาม path จาก edge ถัดไป
+    # 2) เวลาตามเส้นทางจาก edge ถัดไป
     path_time = 0.0
     if len(route_edges) >= 2:
         for u, v in zip(route_edges[:-1], route_edges[1:]):
@@ -275,6 +268,25 @@ def predict_remaining_time_for_route(G, current_edge, lane_id, lane_pos, route_e
             path_time += float(w)
 
     return rem_time_cur + path_time
+
+def snapshot_prediction(vs, snap_time, pred_remaining):
+    """เริ่มรอบการทำนายใหม่"""
+    vs["last_decision_time"] = float(snap_time)
+    vs["last_pred_remaining"] = float(pred_remaining)
+
+def close_out_prediction(vs, now_time):
+    """ปิดรอบการทำนายปัจจุบัน → คืน (abs_err, rel_err) หรือ (None, None) ถ้าไม่มีรอบค้าง"""
+    last_t = vs.get("last_decision_time", None)
+    pred   = vs.get("last_pred_remaining", None)
+    if (last_t is None) or (pred is None):
+        return (None, None)
+    actual = max(0.0, float(now_time) - float(last_t))
+    abs_err = abs(actual - float(pred))
+    rel_err = (abs_err / actual) if actual > 1e-6 else 0.0
+    # เคลียร์ snapshot เดิม (ถ้าอยากเก็บเป็นลิสต์ประวัติ ค่อยขยายเพิ่มได้)
+    vs.pop("last_decision_time", None)
+    vs.pop("last_pred_remaining", None)
+    return (abs_err, rel_err)
 
 # =========================
 # Main
@@ -303,7 +315,7 @@ def main():
     print("[INFO] Launching:", " ".join(cmd))
     traci.start(cmd)
 
-    # ---- MAE / RMAE accumulators (local to main) ----
+    # ---- Accumulators (per decision window) ----
     mae_abs_sum = 0.0
     mae_rel_sum = 0.0
     mae_count   = 0
@@ -363,7 +375,6 @@ def main():
                             "last_wait_acc": traci.vehicle.getAccumulatedWaitingTime(vid),
                             "co2_mg": 0.0,
                             "fuel_ml": 0.0,
-                            # snapshot fields will be added later
                         }
                     except traci.TraCIException:
                         vehicle_states[vid] = {
@@ -388,9 +399,7 @@ def main():
                     for u, v in G.edges:
                         G.edges[u, v]["w"] = per_out_edge_cost[v]
 
-                step_classes = set()
-                for vid in active_ids:
-                    step_classes.add(get_vehicle_class(vid) or "_ANY_")
+                step_classes = {get_vehicle_class(vid) or "_ANY_" for vid in active_ids}
 
                 for cls in step_classes:
                     if cls not in edge_graph_cache:
@@ -457,12 +466,23 @@ def main():
                     if len(new_route) >= 2 and is_uturn_pair(new_route[0], new_route[1]):
                         continue
 
+                    # ---- Close previous decision window BEFORE setting new route ----
+                    vs = vehicle_states.get(vid)
+                    if vs is not None:
+                        abs_err, rel_err = close_out_prediction(vs, sim_time)
+                        if abs_err is not None:
+                            mae_abs_sum += abs_err
+                            mae_rel_sum += rel_err
+                            mae_count   += 1
+                            mae_roll_abs.append(abs_err)
+                            mae_roll_rel.append(rel_err)
+
                     try:
                         traci.vehicle.setRoute(vid, new_route)
                         last_reroute[vid] = sim_time
                         invalid_count[vid] = 0
 
-                        # ---- Snapshot for MAE/RMAE at decision time ----
+                        # ---- Snapshot NEW decision window ----
                         vs = vehicle_states.get(vid)
                         if vs is not None:
                             try:
@@ -471,14 +491,12 @@ def main():
                             except traci.TraCIException:
                                 lane_id, lane_pos = None, 0.0
                             pred_rem = predict_remaining_time_for_route(G, cur_edge, lane_id, lane_pos, new_route)
-                            vs["last_decision_time"] = sim_time
-                            vs["last_pred_remaining"] = float(pred_rem)
-                        # -----------------------------------------------
+                            snapshot_prediction(vs, sim_time, pred_rem)
 
                     except traci.TraCIException:
                         continue
 
-                # ---- Make initial snapshot for vehicles that never snapped yet (use current route) ----
+                # ---- Initial snapshot for vehicles that never snapped yet ----
                 for vid in active_ids:
                     vs = vehicle_states.get(vid)
                     if not vs or ("last_decision_time" in vs):
@@ -490,24 +508,19 @@ def main():
                         route = traci.vehicle.getRoute(vid)
                         if not route:
                             continue
-                        dest_edge = route[-1]
                         veh_class = get_vehicle_class(vid)
                         key = veh_class or "_ANY_"
-                        if key not in edge_graph_cache:
-                            edge_graph_cache[key] = build_edge_graph_from_traci(veh_class)
-                        G = edge_graph_cache[key]
-                        if cur_edge not in G or dest_edge not in G:
+                        G = edge_graph_cache.get(key)
+                        if not G or (cur_edge not in G) or (route[-1] not in G):
                             continue
                         lane_id = traci.vehicle.getLaneID(vid)
                         lane_pos = traci.vehicle.getLanePosition(vid)
                         pred_rem = predict_remaining_time_for_route(G, cur_edge, lane_id, lane_pos, route)
-                        vs["last_decision_time"] = sim_time
-                        vs["last_pred_remaining"] = float(pred_rem)
+                        snapshot_prediction(vs, sim_time, pred_rem)
                     except traci.TraCIException:
                         pass
-                # -------------------------------------------------------------------------------
 
-            # 4) arrivals → metrics (and finalize MAE/RMAE for that vehicle)
+            # 4) arrivals → metrics (and close any open window)
             for vid in traci.simulation.getArrivedIDList():
                 vs = vehicle_states.get(vid)
                 if vs is None:
@@ -522,14 +535,10 @@ def main():
                 except Exception:
                     pass
 
-                # ---- MAE/RMAE close-out for this vehicle (from last decision) ----
+                # ---- Close any open decision window at arrival ----
                 try:
-                    last_dec_t = vs.get("last_decision_time", None)
-                    pred_rem   = vs.get("last_pred_remaining", None)
-                    if (last_dec_t is not None) and (pred_rem is not None):
-                        actual_rem = max(0.0, sim_time - float(last_dec_t))
-                        abs_err = abs(actual_rem - float(pred_rem))
-                        rel_err = (abs_err / actual_rem) if actual_rem > 1e-6 else 0.0
+                    abs_err, rel_err = close_out_prediction(vs, sim_time)
+                    if abs_err is not None:
                         mae_abs_sum += abs_err
                         mae_rel_sum += rel_err
                         mae_count   += 1
@@ -562,15 +571,15 @@ def main():
         wall_end = time.perf_counter()
         processing_time = wall_end - wall_start
 
-        # ---- MAE / RMAE summary ----
+        # ---- MAE / RMAE over decision windows ----
         if mae_count > 0:
-            mae  = mae_abs_sum / mae_count
-            rmae = mae_rel_sum / mae_count
+            mae_dec  = mae_abs_sum / mae_count
+            rmae_dec = mae_rel_sum / mae_count
         else:
-            mae = rmae = 0.0
+            mae_dec = rmae_dec = 0.0
 
-        roll_mae  = (sum(mae_roll_abs) / len(mae_roll_abs)) if mae_roll_abs else 0.0
-        roll_rmae = (sum(mae_roll_rel) / len(mae_roll_rel)) if mae_roll_rel else 0.0
+        roll_mae_dec  = (sum(mae_roll_abs) / len(mae_roll_abs)) if mae_roll_abs else 0.0
+        roll_rmae_dec = (sum(mae_roll_rel) / len(mae_roll_rel)) if mae_roll_rel else 0.0
 
         print("\n===== Simulation Summary =====")
         print(f"Vehicles simulated (included):  {vehicle_count}")
@@ -581,10 +590,10 @@ def main():
         print(f"Total CO2 emission:             {total_co2_mg:.3f} mg")
         print(f"Total fuel consumption:         {total_fuel_ml:.3f} ml")
         print(f"(Aggregates written to: {agg_csv})")
-        print(f"\nMAE (remaining time):           {mae:.3f} s")
-        print(f"RMAE (remaining time):          {rmae:.3f}")
-        print(f"MAE last {len(mae_roll_abs) or 0} veh:          {roll_mae:.3f} s")
-        print(f"RMAE last {len(mae_roll_rel) or 0} veh:         {roll_rmae:.3f}")
+        print(f"\nMAE per decision window:        {mae_dec:.3f} s")
+        print(f"RMAE per decision window:       {rmae_dec:.3f}")
+        print(f"MAE last {len(mae_roll_abs) or 0} windows:       {roll_mae_dec:.3f} s")
+        print(f"RMAE last {len(mae_roll_rel) or 0} windows:      {roll_rmae_dec:.3f}")
         print(f"\nProcessing time (wall-clock):   {processing_time:.2f} s")
 
     finally:
