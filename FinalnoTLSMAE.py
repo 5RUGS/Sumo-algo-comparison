@@ -1,9 +1,36 @@
 # FinalnoTLS.py
 # -*- coding: utf-8 -*-
 
-import os, sys, glob, csv, time, xml.etree.ElementTree as ET
+"""
+========================================
+SUMO Routing (No TLS) — Readable Layout
+========================================
+
+สารบัญ
+  1) Imports & Bootstrap
+  2) Parameters (ค่าตั้งค่า)
+  3) Global Rolling Buffers
+  4) Config Helpers           -> หาไฟล์ .sumocfg / .net.xml / route-files
+  5) Lane/Edge Utilities      -> ฟังก์ชันช่วยเกี่ยวกับเลน/เอดจ์
+  6) Build Edge Graph         -> สร้างกราฟ (nodes=edges) จาก TraCI
+  7) Cost Model (No TLS)      -> expected_speed + คำนวณน้ำหนัก w
+  8) Prediction Helper        -> ประเมินเวลาที่เหลือบนเส้นทางปัจจุบัน (Method A)
+  9) Main Loop                -> รันซิมูเลชัน, reroute, เก็บสถิติ, สรุปผล
+"""
+
+# -------------------------------------------------------------------
+# 1) IMPORTS & BOOTSTRAP
+# -------------------------------------------------------------------
+import os
+import sys
+import glob
+import csv
+import time
+import xml.etree.ElementTree as ET
 from collections import defaultdict, deque
+from typing import Dict, List, Optional, Set, Tuple
 import warnings
+
 warnings.filterwarnings("ignore", message=".*deprecated function getAllProgramLogics.*")
 
 # ---- SUMO bootstrap ----
@@ -17,40 +44,45 @@ if "SUMO_HOME" in os.environ:
     if os.path.isdir(TOOLS):
         sys.path.append(TOOLS)
 
-import traci, sumolib, networkx as nx
+import traci  # type: ignore
+import sumolib  # type: ignore
+import networkx as nx  # type: ignore
 
-# =========================
-# Parameters
-# =========================
-REROUTE_PERIOD = 15.0
-NEAR_JUNCTION_SKIP_DIST = 0.0
-DENSITY_ALPHA = 1.5
-MIN_SPEED_FRACTION = 0.3
-OCCUPANCY_FREE_THRESH = 0.1
-SMOOTHING_MIN_SPEED = 1.5
 
-INVALID_THRESHOLD = 2
-PROGRESS_EVERY_SIMSEC = 30
+# -------------------------------------------------------------------
+# 2) PARAMETERS (ค่าตั้งค่า)
+# -------------------------------------------------------------------
+REROUTE_PERIOD: float = 15.0           # ระยะเวลาประเมิน reroute (ยังคงโครงสร้างเดิม, แม้ไม่ได้ใช้ตรงๆ)
+NEAR_JUNCTION_SKIP_DIST: float = 0.0   # ใกล้จุดตัดให้ข้ามการ setRoute
+DENSITY_ALPHA: float = 1.5             # ค่าถ่วงความหนาแน่น
+MIN_SPEED_FRACTION: float = 0.3        # ความเร็วสำรองขั้นต่ำ (ส่วนของ speed_limit)
+OCCUPANCY_FREE_THRESH: float = 0.1     # ถ้าบางมาก ให้ใช้ speed_limit เต็ม
+SMOOTHING_MIN_SPEED: float = 1.5       # เกณฑ์ความเร็วหลัง smooth
 
-NO_OPT = False
-TAG = ""
+INVALID_THRESHOLD: int = 2             # ความพยายาม fallback rerouteTraveltime
+PROGRESS_EVERY_SIMSEC: int = 30        # print ความคืบหน้าทุก X วินาทีจำลอง
 
-# Rolling buffers per-edge
-WINDOW_N = 10
-EDGE_BUF = {}  # edge_id -> {"speed": deque(maxlen=WINDOW_N), "occ": deque(maxlen=WINDOW_N)}
+NO_OPT: bool = False                   # ปิด/เปิดการ optimize เส้นทาง
+TAG: str = ""                          # ต่อท้ายชื่อไฟล์สรุป
 
-# =========================
-# Config helpers
-# =========================
+# -------------------------------------------------------------------
+# 3) GLOBAL ROLLING BUFFERS (สำหรับ smooth ค่าความเร็ว/การครอบครอง)
+# -------------------------------------------------------------------
+WINDOW_N: int = 10
+EDGE_BUF: Dict[str, Dict[str, deque]] = {}  # edge_id -> {"speed": deque, "occ": deque}
+
+
+# -------------------------------------------------------------------
+# 4) CONFIG HELPERS — หาเส้นทางไฟล์จาก .sumocfg
+# -------------------------------------------------------------------
 def resolve_cfg_path() -> str:
     """
-    Order:
-      1) argv[1] if provided and exists
-      2) env SUMO_CFG if exists
-      3) ./osm.sumocfg if exists
-      4) first *.sumocfg in CWD
+    ลำดับการหา .sumocfg:
+      1) sys.argv[1]
+      2) env: SUMO_CFG
+      3) ./osm.sumocfg
+      4) ไฟล์ *.sumocfg อันแรกในโฟลเดอร์
     """
-    # 1) CLI arg
     if len(sys.argv) > 1:
         arg = sys.argv[1]
         if os.path.isabs(arg) and os.path.exists(arg):
@@ -59,25 +91,26 @@ def resolve_cfg_path() -> str:
         if os.path.exists(cand):
             return cand
 
-    # 2) env
     env_cfg = os.environ.get("SUMO_CFG")
     if env_cfg:
         cand = os.path.abspath(env_cfg)
         if os.path.exists(cand):
             return cand
 
-    # 3) preferred default
     if os.path.exists("osm.sumocfg"):
         return os.path.abspath("osm.sumocfg")
 
-    # 4) any *.sumocfg
     all_cfgs = sorted(glob.glob("*.sumocfg"))
     if all_cfgs:
         return os.path.abspath(all_cfgs[0])
 
-    raise FileNotFoundError("No .sumocfg found. Pass it as argv[1] or set SUMO_CFG or place osm.sumocfg in CWD.")
+    raise FileNotFoundError(
+        "No .sumocfg found. Pass it as argv[1] or set SUMO_CFG or place osm.sumocfg in CWD."
+    )
 
-def read_net_from_cfg(cfg_path):
+
+def read_net_from_cfg(cfg_path: str) -> Optional[str]:
+    """คืน path ของ .net.xml ที่อ้างใน .sumocfg (ถ้า parse ไม่ได้ จะลองหา *.net.xml ในโฟลเดอร์)"""
     try:
         root = ET.parse(cfg_path).getroot()
         tag = root.find(".//input/net-file")
@@ -85,10 +118,13 @@ def read_net_from_cfg(cfg_path):
             return os.path.abspath(os.path.join(os.path.dirname(cfg_path), tag.attrib["value"]))
     except ET.ParseError:
         pass
-    nets = glob.glob("*.net.xml*")
+
+    nets = glob.glob("*.net.xml*")  # เผื่อ .gz
     return os.path.abspath(nets[0]) if nets else None
 
-def read_route_files_from_cfg(cfg_path):
+
+def read_route_files_from_cfg(cfg_path: str) -> List[str]:
+    """คืนลิสต์ route-files (absolute paths) จาก .sumocfg"""
     try:
         root = ET.parse(cfg_path).getroot()
         tag = root.find(".//input/route-files")
@@ -99,15 +135,18 @@ def read_route_files_from_cfg(cfg_path):
     except ET.ParseError:
         return []
 
-# =========================
-# Lane/edge utils
-# =========================
-def _safe_iter_out_lanes(lane_id):
+
+# -------------------------------------------------------------------
+# 5) LANE/EDGE UTILITIES — ฟังก์ชันช่วยเกี่ยวกับเลน/เอดจ์
+# -------------------------------------------------------------------
+def _safe_iter_out_lanes(lane_id: str) -> List[str]:
+    """คืนลิสต์เลนปลายทางที่เชื่อมจาก lane_id (ถ้า error คืนลิสต์ว่าง)"""
     try:
         links = traci.lane.getLinks(lane_id)
     except traci.TraCIException:
         return []
-    outs = []
+
+    outs: List[str] = []
     for lk in links:
         try:
             to_lane = lk[0] if isinstance(lk, (list, tuple)) else getattr(lk, "toLane", None)
@@ -117,7 +156,9 @@ def _safe_iter_out_lanes(lane_id):
             outs.append(to_lane)
     return outs
 
-def _lane_allows_class(lane_id, vehicle_class):
+
+def _lane_allows_class(lane_id: str, vehicle_class: Optional[str]) -> bool:
+    """เลนนี้อนุญาต vehicle_class หรือไม่ (None = ผ่าน)"""
     if not vehicle_class:
         return True
     try:
@@ -131,30 +172,40 @@ def _lane_allows_class(lane_id, vehicle_class):
     except traci.TraCIException:
         return True
 
-def get_vehicle_class(veh_id):
+
+def get_vehicle_class(veh_id: str) -> Optional[str]:
+    """อ่าน vehicle class จาก type ของรถ"""
     try:
         vtype = traci.vehicle.getTypeID(veh_id)
         return traci.vehicletype.getVehicleClass(vtype)
     except traci.TraCIException:
         return None
 
-def next_edges_allowed_from_current_lane(veh_id):
+
+def next_edges_allowed_from_current_lane(veh_id: str) -> Set[str]:
+    """คืนชุด edge ที่ไปต่อได้จากเลนปัจจุบันของรถ (ฐานเป็น edge_id)"""
     try:
         lane_id = traci.vehicle.getLaneID(veh_id)
         return {ln.split("_")[0] for ln in _safe_iter_out_lanes(lane_id)}
     except traci.TraCIException:
         return set()
 
-def lane_has_link_to_edge(lane_id, edge_id):
+
+def lane_has_link_to_edge(lane_id: str, edge_id: str) -> bool:
+    """เลนนี้มีลิงก์ไปยังเลนที่อยู่บน edge_id หรือไม่"""
     for toLane in _safe_iter_out_lanes(lane_id):
         if toLane.split("_")[0] == edge_id:
             return True
     return False
 
-def is_uturn_pair(a, b):
+
+def is_uturn_pair(a: str, b: str) -> bool:
+    """ตรวจ u-turn รูปแบบ 'x' <-> '-x'"""
     return (a == "-" + b) or (b == "-" + a)
 
-def has_edge_connection_any_lane(a, b):
+
+def has_edge_connection_any_lane(a: str, b: str) -> bool:
+    """edge a เชื่อมไป edge b หรือไม่ (เช็คทุกเลนของ a)"""
     try:
         for lane_id in traci.edge.getLaneIDs(a):
             if lane_has_link_to_edge(lane_id, b):
@@ -163,13 +214,21 @@ def has_edge_connection_any_lane(a, b):
         pass
     return False
 
-# =========================
-# Build EDGE graph
-# =========================
-def build_edge_graph_from_traci(vehicle_class=None):
+
+# -------------------------------------------------------------------
+# 6) BUILD EDGE GRAPH — สร้างกราฟ (nodes=edges) จาก TraCI
+# -------------------------------------------------------------------
+def build_edge_graph_from_traci(vehicle_class: Optional[str] = None) -> nx.DiGraph:
+    """
+    กราฟกำกับทิศ (DiGraph) โดย node คือ edge (ถอด ':' ออก)
+      node attrs: length, speed_limit
+      edge attrs: (น้ำหนัก 'w' จะเติมภายหลัง)
+    """
     G = nx.DiGraph()
+
+    # Nodes: edges ทั้งหมด (ยกเว้น internal edge ขึ้นต้น ':')
     for eid in traci.edge.getIDList():
-        if not eid or eid.startswith(":"):
+        if (not eid) or eid.startswith(":"):
             continue
         try:
             length = traci.edge.getLength(eid)
@@ -181,12 +240,14 @@ def build_edge_graph_from_traci(vehicle_class=None):
             speed_limit = 13.9
         G.add_node(eid, length=length, speed_limit=speed_limit)
 
+    # Edges: จากการเชื่อมของเลน (กรองตาม vehicle_class)
     for lane_id in traci.lane.getIDList():
         base_edge = lane_id.split("_")[0] if "_" in lane_id else lane_id
         if (not base_edge) or base_edge.startswith(":") or (base_edge not in G):
             continue
         if not _lane_allows_class(lane_id, vehicle_class):
             continue
+
         for toLane in _safe_iter_out_lanes(lane_id):
             to_edge = toLane.split("_")[0]
             if (not to_edge) or to_edge.startswith(":") or (to_edge not in G):
@@ -194,12 +255,20 @@ def build_edge_graph_from_traci(vehicle_class=None):
             if not _lane_allows_class(toLane, vehicle_class):
                 continue
             G.add_edge(base_edge, to_edge)
+
     return G
 
-# =========================
-# Cost model (no TLS)
-# =========================
-def expected_speed(out_edge, speed_limit):
+
+# -------------------------------------------------------------------
+# 7) COST MODEL (No TLS) — expected_speed & การคำนวณน้ำหนัก w
+# -------------------------------------------------------------------
+def expected_speed(out_edge: str, speed_limit: float) -> Tuple[float, float]:
+    """
+    คืน (use_speed, sm_occ)
+      - use_speed: ความเร็วที่คาดหวังแบบ smooth
+      - sm_occ: occupancy แบบ smooth
+    ใช้ rolling buffers จาก EDGE_BUF เพื่อกันค่าแกว่ง
+    """
     try:
         occ = traci.edge.getLastStepOccupancy(out_edge)
     except Exception:
@@ -209,7 +278,7 @@ def expected_speed(out_edge, speed_limit):
     except Exception:
         mean_speed = None
 
-    if not isinstance(occ, (int, float)) or occ != occ:
+    if not isinstance(occ, (int, float)) or occ != occ:  # NaN
         occ = 0.0
     occ = max(0.0, min(1.0, float(occ)))
 
@@ -221,7 +290,7 @@ def expected_speed(out_edge, speed_limit):
     buf["occ"].append(float(occ))
 
     sm_speed = sum(buf["speed"]) / len(buf["speed"])
-    sm_occ   = sum(buf["occ"]) / len(buf["occ"])
+    sm_occ = sum(buf["occ"]) / len(buf["occ"])
 
     if sm_occ < OCCUPANCY_FREE_THRESH:
         use_speed = max(speed_limit, 0.1)
@@ -232,21 +301,29 @@ def expected_speed(out_edge, speed_limit):
 
     return use_speed, sm_occ
 
-# =========================
-# Prediction helpers (Approach 2: per decision window)
-# =========================
-def predict_remaining_time_for_route(G, current_edge, lane_id, lane_pos, route_edges):
+
+# -------------------------------------------------------------------
+# 8) PREDICTION HELPER (METHOD A) — เวลาที่เหลือจากจุดปัจจุบัน
+# -------------------------------------------------------------------
+def predict_remaining_time_for_route(
+    G: nx.DiGraph,
+    current_edge: str,
+    lane_id: Optional[str],
+    lane_pos: float,
+    route_edges: List[str],
+) -> float:
     """
-    คาดเวลาเดินทางที่เหลือจาก 'จุดปัจจุบัน' บน lane_id/lane_pos
-    - คิดเศษระยะบนเลนปัจจุบัน
-    - บวกน้ำหนักของขอบถัด ๆ ไป (G.edges[u,v]["w"]) ถ้าไม่มี weight ใช้ length/speed_limit ของ node ปลายทาง v
+    ประเมินเวลาที่เหลือ:
+      (1) ส่วนที่เหลือบนเลนปัจจุบันของ current_edge  -> ใช้ expected_speed(current_edge)
+      (2) บวกน้ำหนัก 'w' ของขอบถัดๆ ไปใน route_edges
+          - ถ้าไม่มี w ให้ประมาณ ln/speed_limit ของ node v
     """
+    # เศษระยะบนเลนปัจจุบัน
     try:
-        lane_len = traci.lane.getLength(lane_id)
+        lane_len = traci.lane.getLength(lane_id) if lane_id is not None else None
     except Exception:
         lane_len = None
 
-    # 1) เศษระยะบน edge ปัจจุบัน
     rem_time_cur = 0.0
     if lane_len is not None:
         rem_len = max(0.0, lane_len - lane_pos)
@@ -255,7 +332,7 @@ def predict_remaining_time_for_route(G, current_edge, lane_id, lane_pos, route_e
         use_speed, _ = expected_speed(current_edge, speed_limit)
         rem_time_cur = rem_len / max(use_speed, 0.1)
 
-    # 2) เวลาตามเส้นทางจาก edge ถัดไป
+    # เวลาสำหรับขอบถัดไป
     path_time = 0.0
     if len(route_edges) >= 2:
         for u, v in zip(route_edges[:-1], route_edges[1:]):
@@ -269,31 +346,14 @@ def predict_remaining_time_for_route(G, current_edge, lane_id, lane_pos, route_e
 
     return rem_time_cur + path_time
 
-def snapshot_prediction(vs, snap_time, pred_remaining):
-    """เริ่มรอบการทำนายใหม่"""
-    vs["last_decision_time"] = float(snap_time)
-    vs["last_pred_remaining"] = float(pred_remaining)
 
-def close_out_prediction(vs, now_time):
-    """ปิดรอบการทำนายปัจจุบัน → คืน (abs_err, rel_err) หรือ (None, None) ถ้าไม่มีรอบค้าง"""
-    last_t = vs.get("last_decision_time", None)
-    pred   = vs.get("last_pred_remaining", None)
-    if (last_t is None) or (pred is None):
-        return (None, None)
-    actual = max(0.0, float(now_time) - float(last_t))
-    abs_err = abs(actual - float(pred))
-    rel_err = (abs_err / actual) if actual > 1e-6 else 0.0
-    # เคลียร์ snapshot เดิม (ถ้าอยากเก็บเป็นลิสต์ประวัติ ค่อยขยายเพิ่มได้)
-    vs.pop("last_decision_time", None)
-    vs.pop("last_pred_remaining", None)
-    return (abs_err, rel_err)
-
-# =========================
-# Main
-# =========================
-def main():
+# -------------------------------------------------------------------
+# 9) MAIN LOOP — รันซิม, reroute, เก็บสถิติ, สรุปผล
+# -------------------------------------------------------------------
+def main() -> None:
     wall_start = time.perf_counter()
 
+    # -- เตรียมไฟล์จำเป็น
     cfg = resolve_cfg_path()
     net_path = read_net_from_cfg(cfg)
     if not net_path or not os.path.exists(net_path):
@@ -310,36 +370,37 @@ def main():
         print("[ROUTES] " + ", ".join(route_files))
 
     agg_csv = f"aggregates{TAG}.csv"
-    sumo_bin = sumolib.checkBinary("sumo")  # change to "sumo-gui" if you want GUI
+
+    # -- เริ่ม SUMO (เปลี่ยนเป็น 'sumo-gui' ได้ถ้าต้องการ GUI)
+    sumo_bin = sumolib.checkBinary("sumo")
     cmd = [sumo_bin, "-c", cfg, "--quit-on-end"]
     print("[INFO] Launching:", " ".join(cmd))
     traci.start(cmd)
 
-    # ---- Accumulators (per decision window) ----
-    mae_abs_sum = 0.0
-    mae_rel_sum = 0.0
-    mae_count   = 0
-    MAE_ROLL_N  = 10
-    mae_roll_abs = deque(maxlen=MAE_ROLL_N)
-    mae_roll_rel = deque(maxlen=MAE_ROLL_N)
+    # ---- ตัวแปรสะสมสำหรับ Method A (per-vehicle last snapshot)
+    maeV_abs_sum: float = 0.0
+    maeV_count: int = 0
+    PER_VEHICLE_MIN_HORIZON: float = 0.0  # ตั้ง >0 เพื่อกรอง snapshot ใกล้ถึงมากๆ
 
     try:
-        last_reroute = defaultdict(lambda: -1e9)
-        invalid_count = defaultdict(int)
+        last_reroute = defaultdict(lambda: -1e9)  # คงไว้ตามโครงสร้างเดิม
+        invalid_count: Dict[str, int] = defaultdict(int)
 
-        # Per-vehicle states
-        vehicle_states = {}
+        # สถานะรายคัน
+        vehicle_states: Dict[str, Dict[str, float]] = {}
 
-        # Aggregates
-        total_travel_time = 0.0
-        total_waiting_time = 0.0
-        total_co2_mg = 0.0
-        total_fuel_ml = 0.0
-        vehicle_count = 0
+        # ตัวสะสมภาพรวม
+        total_travel_time: float = 0.0
+        total_waiting_time: float = 0.0
+        total_co2_mg: float = 0.0
+        total_fuel_ml: float = 0.0
+        vehicle_count: int = 0
 
-        edge_graph_cache = {}
-        last_progress_bucket = -1
+        # แคชกราฟแยกตาม class
+        edge_graph_cache: Dict[str, nx.DiGraph] = {}
+        last_progress_bucket: int = -1
 
+        # ======= วนรอบซิมูเลชัน =======
         while traci.simulation.getMinExpectedNumber() > 0:
             traci.simulationStep()
             sim_time = traci.simulation.getTime()
@@ -350,8 +411,8 @@ def main():
             except Exception:
                 step_sec = 1.0
 
-            # 1) accumulate per-step
-            active_ids = set(traci.vehicle.getIDList())
+            # (1) อัปเดตค่าสะสมรายคันที่ยังวิ่งอยู่
+            active_ids: Set[str] = set(traci.vehicle.getIDList())
             for vid, vs in list(vehicle_states.items()):
                 if vid not in active_ids:
                     continue
@@ -360,54 +421,68 @@ def main():
                     delta_wait = max(0.0, curr_acc_wait - vs.get("last_wait_acc", 0.0))
                     vs["waiting_time"] += delta_wait
                     vs["last_wait_acc"] = curr_acc_wait
-                    vs["co2_mg"]  += traci.vehicle.getCO2Emission(vid) * step_sec
+                    vs["co2_mg"] += traci.vehicle.getCO2Emission(vid) * step_sec
                     vs["fuel_ml"] += traci.vehicle.getFuelConsumption(vid) * step_sec
                 except traci.TraCIException:
                     pass
 
-            # 2) init new vehicles
+            # (2) ลงทะเบียนคันที่เพิ่งออกตัว
             for vid in active_ids:
-                if vid not in vehicle_states:
-                    try:
-                        vehicle_states[vid] = {
-                            "depart_time": sim_time,
-                            "waiting_time": 0.0,
-                            "last_wait_acc": traci.vehicle.getAccumulatedWaitingTime(vid),
-                            "co2_mg": 0.0,
-                            "fuel_ml": 0.0,
-                        }
-                    except traci.TraCIException:
-                        vehicle_states[vid] = {
-                            "depart_time": sim_time,
-                            "waiting_time": 0.0,
-                            "last_wait_acc": 0.0,
-                            "co2_mg": 0.0,
-                            "fuel_ml": 0.0,
-                        }
+                if vid in vehicle_states:
+                    continue
+                try:
+                    vehicle_states[vid] = {
+                        "depart_time": sim_time,
+                        "waiting_time": 0.0,
+                        "last_wait_acc": traci.vehicle.getAccumulatedWaitingTime(vid),
+                        "co2_mg": 0.0,
+                        "fuel_ml": 0.0,
+                        # snapshot fields (จะใส่ภายหลังเมื่อ reroute/setRoute)
+                        # "last_decision_time": float,
+                        # "last_pred_remaining": float,
+                    }
+                except traci.TraCIException:
+                    vehicle_states[vid] = {
+                        "depart_time": sim_time,
+                        "waiting_time": 0.0,
+                        "last_wait_acc": 0.0,
+                        "co2_mg": 0.0,
+                        "fuel_ml": 0.0,
+                    }
 
-            # 3) reroute + (build graphs/weights)
+            # (3) คำนวณน้ำหนัก + reroute
             if not NO_OPT:
-                def compute_edge_weights_for_class(veh_class_key, G):
-                    per_out_edge_cost = {}
+
+                def compute_edge_weights_for_class(veh_class_key: str, G: nx.DiGraph) -> None:
+                    """
+                    คิดค่า cost ที่ node v (คือ edge ปลายทาง):
+                      base_tt(v) = length(v) / expected_speed(v)
+                      cost(v)    = base_tt(v) * (1 + DENSITY_ALPHA * occ(v))
+                    แล้วเซ็ต w สำหรับ edge (u,v) = cost(v)
+                    """
+                    per_out_edge_cost: Dict[str, float] = {}
+
+                    # node v -> คำนวณ cost
                     for v in G.nodes:
                         nd = G.nodes[v]
                         speed_limit = nd.get("speed_limit", 13.9)
                         use_speed, occ = expected_speed(v, speed_limit)
                         base_tt = nd.get("length", 1.0) / max(use_speed, 0.1)
-                        cost = base_tt * (1.0 + DENSITY_ALPHA * float(occ))
-                        per_out_edge_cost[v] = cost
+                        per_out_edge_cost[v] = base_tt * (1.0 + DENSITY_ALPHA * float(occ))
+
+                    # กระจายน้ำหนักไปยังแต่ละ (u,v)
                     for u, v in G.edges:
                         G.edges[u, v]["w"] = per_out_edge_cost[v]
 
-                step_classes = {get_vehicle_class(vid) or "_ANY_" for vid in active_ids}
-
+                # เตรียมกราฟตาม class ที่มีในสเต็ปนี้
+                step_classes: Set[str] = {get_vehicle_class(vid) or "_ANY_" for vid in active_ids}
                 for cls in step_classes:
                     if cls not in edge_graph_cache:
                         real_cls = None if cls == "_ANY_" else cls
                         edge_graph_cache[cls] = build_edge_graph_from_traci(real_cls)
                     compute_edge_weights_for_class(cls, edge_graph_cache[cls])
 
-                # reroute per vehicle
+                # reroute รายคัน
                 for vid in active_ids:
                     try:
                         lane_id = traci.vehicle.getLaneID(vid)
@@ -419,33 +494,37 @@ def main():
                         pass
 
                     cur_edge = traci.vehicle.getRoadID(vid)
-                    if not cur_edge or cur_edge.startswith(":"):
+                    if (not cur_edge) or cur_edge.startswith(":"):
                         continue
+
                     try:
                         route = traci.vehicle.getRoute(vid)
                     except traci.TraCIException:
                         continue
                     if not route:
                         continue
+
                     dest_edge = route[-1]
-                    if not dest_edge or dest_edge.startswith(":"):
+                    if (not dest_edge) or dest_edge.startswith(":"):
                         continue
 
                     veh_class = get_vehicle_class(vid)
                     key = veh_class or "_ANY_"
                     if key not in edge_graph_cache:
                         edge_graph_cache[key] = build_edge_graph_from_traci(veh_class)
+
                     G = edge_graph_cache[key]
                     if cur_edge not in G or dest_edge not in G:
                         invalid_count[vid] += 1
                         if invalid_count[vid] >= INVALID_THRESHOLD:
                             invalid_count[vid] = 0
                         try:
-                            traci.vehicle.rerouteTraveltime(vid)
+                            traci.vehicle.rerouteTraveltime(vid)  # fallback ของ SUMO
                         except traci.TraCIException:
                             pass
                         continue
 
+                    # เส้นทางน้ำหนักต่ำสุด
                     try:
                         edge_path_new = nx.shortest_path(G, cur_edge, dest_edge, weight="w")
                     except Exception:
@@ -460,29 +539,19 @@ def main():
 
                     new_route = list(edge_path_new)
 
+                    # เช็กความเป็นไปได้ของขอบถัดไปจากเลนปัจจุบัน + กัน u-turn
                     allowed_from_lane = next_edges_allowed_from_current_lane(vid)
                     if len(new_route) >= 2 and allowed_from_lane and (new_route[1] not in allowed_from_lane):
                         continue
                     if len(new_route) >= 2 and is_uturn_pair(new_route[0], new_route[1]):
                         continue
 
-                    # ---- Close previous decision window BEFORE setting new route ----
-                    vs = vehicle_states.get(vid)
-                    if vs is not None:
-                        abs_err, rel_err = close_out_prediction(vs, sim_time)
-                        if abs_err is not None:
-                            mae_abs_sum += abs_err
-                            mae_rel_sum += rel_err
-                            mae_count   += 1
-                            mae_roll_abs.append(abs_err)
-                            mae_roll_rel.append(rel_err)
-
+                    # setRoute + เก็บ snapshot (Method A)
                     try:
                         traci.vehicle.setRoute(vid, new_route)
                         last_reroute[vid] = sim_time
                         invalid_count[vid] = 0
 
-                        # ---- Snapshot NEW decision window ----
                         vs = vehicle_states.get(vid)
                         if vs is not None:
                             try:
@@ -490,97 +559,111 @@ def main():
                                 lane_pos = traci.vehicle.getLanePosition(vid)
                             except traci.TraCIException:
                                 lane_id, lane_pos = None, 0.0
+
                             pred_rem = predict_remaining_time_for_route(G, cur_edge, lane_id, lane_pos, new_route)
-                            snapshot_prediction(vs, sim_time, pred_rem)
+                            vs["last_decision_time"] = float(sim_time)
+                            vs["last_pred_remaining"] = float(pred_rem)
 
                     except traci.TraCIException:
                         continue
 
-                # ---- Initial snapshot for vehicles that never snapped yet ----
+                # เติม snapshot เริ่มต้นให้คันที่ยังไม่เคย snapshot (ใช้ route ปัจจุบัน)
                 for vid in active_ids:
                     vs = vehicle_states.get(vid)
-                    if not vs or ("last_decision_time" in vs):
+                    if (not vs) or ("last_decision_time" in vs):
                         continue
                     try:
                         cur_edge = traci.vehicle.getRoadID(vid)
-                        if not cur_edge or cur_edge.startswith(":"):
+                        if (not cur_edge) or cur_edge.startswith(":"):
                             continue
                         route = traci.vehicle.getRoute(vid)
                         if not route:
                             continue
+
                         veh_class = get_vehicle_class(vid)
                         key = veh_class or "_ANY_"
                         G = edge_graph_cache.get(key)
-                        if not G or (cur_edge not in G) or (route[-1] not in G):
+                        if (not G) or (cur_edge not in G) or (route[-1] not in G):
                             continue
+
                         lane_id = traci.vehicle.getLaneID(vid)
                         lane_pos = traci.vehicle.getLanePosition(vid)
                         pred_rem = predict_remaining_time_for_route(G, cur_edge, lane_id, lane_pos, route)
-                        snapshot_prediction(vs, sim_time, pred_rem)
+                        vs["last_decision_time"] = float(sim_time)
+                        vs["last_pred_remaining"] = float(pred_rem)
                     except traci.TraCIException:
                         pass
 
-            # 4) arrivals → metrics (and close any open window)
+            # (4) เมื่อรถถึงปลายทาง -> อัปเดตสถิติ + คำนวณ MAE (Method A)
             for vid in traci.simulation.getArrivedIDList():
                 vs = vehicle_states.get(vid)
                 if vs is None:
                     continue
+
                 try:
                     travel_time = sim_time - vs.get("depart_time", sim_time)
-                    total_travel_time   += travel_time
-                    total_waiting_time  += vs.get("waiting_time", 0.0)
-                    total_co2_mg        += vs.get("co2_mg", 0.0)
-                    total_fuel_ml       += vs.get("fuel_ml", 0.0)
-                    vehicle_count       += 1
+                    total_travel_time += travel_time
+                    total_waiting_time += vs.get("waiting_time", 0.0)
+                    total_co2_mg += vs.get("co2_mg", 0.0)
+                    total_fuel_ml += vs.get("fuel_ml", 0.0)
+                    vehicle_count += 1
                 except Exception:
                     pass
 
-                # ---- Close any open decision window at arrival ----
+                # Snapshot สุดท้ายต่อคัน -> ใช้คำนวณ MAE
                 try:
-                    abs_err, rel_err = close_out_prediction(vs, sim_time)
-                    if abs_err is not None:
-                        mae_abs_sum += abs_err
-                        mae_rel_sum += rel_err
-                        mae_count   += 1
-                        mae_roll_abs.append(abs_err)
-                        mae_roll_rel.append(rel_err)
+                    last_dec_t = vs.get("last_decision_time", None)
+                    pred_rem = vs.get("last_pred_remaining", None)
+                    if (last_dec_t is not None) and (pred_rem is not None):
+                        actual_rem = max(0.0, float(sim_time) - float(last_dec_t))
+                        if actual_rem >= PER_VEHICLE_MIN_HORIZON:
+                            abs_err = abs(actual_rem - float(pred_rem))
+                            maeV_abs_sum += abs_err
+                            maeV_count += 1
                 except Exception:
                     pass
                 finally:
                     vehicle_states.pop(vid, None)
 
-            # 5) progress
+            # (5) แสดงความคืบหน้าเป็นงวดๆ
             bucket = int(sim_time) // PROGRESS_EVERY_SIMSEC
             if bucket != last_progress_bucket:
                 last_progress_bucket = bucket
                 print(f"{vehicle_count}", flush=True)
 
-        # ---- Summary ----
+        # ======= สรุปผล =======
         avg_travel = (total_travel_time / vehicle_count) if vehicle_count else 0.0
-        avg_wait   = (total_waiting_time / vehicle_count) if vehicle_count else 0.0
+        avg_wait = (total_waiting_time / vehicle_count) if vehicle_count else 0.0
         avg_co2_mg = (total_co2_mg / vehicle_count) if vehicle_count else 0.0
-        avg_fuel_ml= (total_fuel_ml / vehicle_count) if vehicle_count else 0.0
+        avg_fuel_ml = (total_fuel_ml / vehicle_count) if vehicle_count else 0.0
+
+        if maeV_count > 0:
+            maeV = maeV_abs_sum / maeV_count           # MAE per vehicle (seconds)
+        else:
+            maeV = 0.0
+
+        # RMAE (global normalization): MAE / mean(actual travel time ทั้งชุด)
+        rmae_global = (maeV / avg_travel) if (vehicle_count > 0 and avg_travel > 1e-12) else 0.0
 
         write_header = not os.path.exists(agg_csv)
         with open(agg_csv, "a", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             if write_header:
-                w.writerow(["vehicles", "avg_travel_time_s", "avg_waiting_time_s", "avg_CO2_mg", "avg_fuel_ml"])
-            w.writerow([vehicle_count, f"{avg_travel:.3f}", f"{avg_wait:.3f}", f"{avg_co2_mg:.3f}", f"{avg_fuel_ml:.3f}"])
+                w.writerow([
+                    "vehicles", "avg_travel_time_s", "avg_waiting_time_s",
+                    "avg_CO2_mg", "avg_fuel_ml",
+                    "MAE_per_vehicle_s", "RMAE_global"
+                ])
+            w.writerow([
+                vehicle_count, f"{avg_travel:.3f}", f"{avg_wait:.3f}",
+                f"{avg_co2_mg:.3f}", f"{avg_fuel_ml:.3f}",
+                f"{maeV:.3f}", f"{rmae_global:.6f}"
+            ])
 
         wall_end = time.perf_counter()
         processing_time = wall_end - wall_start
 
-        # ---- MAE / RMAE over decision windows ----
-        if mae_count > 0:
-            mae_dec  = mae_abs_sum / mae_count
-            rmae_dec = mae_rel_sum / mae_count
-        else:
-            mae_dec = rmae_dec = 0.0
-
-        roll_mae_dec  = (sum(mae_roll_abs) / len(mae_roll_abs)) if mae_roll_abs else 0.0
-        roll_rmae_dec = (sum(mae_roll_rel) / len(mae_roll_rel)) if mae_roll_rel else 0.0
-
+        # ---- พิมพ์สรุป
         print("\n===== Simulation Summary =====")
         print(f"Vehicles simulated (included):  {vehicle_count}")
         print(f"Average travel time:            {avg_travel:.3f} s")
@@ -590,10 +673,11 @@ def main():
         print(f"Total CO2 emission:             {total_co2_mg:.3f} mg")
         print(f"Total fuel consumption:         {total_fuel_ml:.3f} ml")
         print(f"(Aggregates written to: {agg_csv})")
-        print(f"\nMAE per decision window:        {mae_dec:.3f} s")
-        print(f"RMAE per decision window:       {rmae_dec:.3f}")
-        print(f"MAE last {len(mae_roll_abs) or 0} windows:       {roll_mae_dec:.3f} s")
-        print(f"RMAE last {len(mae_roll_rel) or 0} windows:      {roll_rmae_dec:.3f}")
+
+        print("\n--- Forecast accuracy (Method A: per vehicle, last snapshot) ---")
+        print(f"MAE per vehicle:                {maeV:.3f} s")
+        print(f"RMAE (global = MAE/avg_tt):     {rmae_global:.6f}")
+
         print(f"\nProcessing time (wall-clock):   {processing_time:.2f} s")
 
     finally:
@@ -602,5 +686,7 @@ def main():
         except Exception:
             pass
 
+
+# Entry point
 if __name__ == "__main__":
     main()
